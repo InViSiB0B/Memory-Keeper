@@ -1,1 +1,1 @@
-FortuneSeer: A budget forecasting tool that helps users visualize how their spending habits affect their future financial situation.
+Memory Keeper: A digital time capsule application that allows user to store memories to be unlocked at future dates.
