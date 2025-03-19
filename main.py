@@ -1,3 +1,5 @@
+from datetime import datetime
+import json
 import sqlite3
 import uuid
 from PyQt5.QtWidgets import (QApplication, QMainWindow, QWidget, QVBoxLayout,
@@ -145,4 +147,67 @@ class MemoryKeeper:
 # # Run the test function
 # if __name__ == "__main__":
 #     test_database_setup()
+
+    def get_db_connection(self):
+        """Establish and return a database connection"""
+        return sqlite3.connect(self.db_path)
+
+    def create_memory(self, title, content, unlock_date, category=None, tags=None,
+                    media_path=None, mood=None, importance=3, unlock_type="date"):
+        
+        """
+        Create a new memory in the database.
+
+        Args:
+            title: Title of the memory
+            content: Text content of the memory
+            unlock_date: When the memory should become available (datetime or str)
+            category: Optional category ID
+            tags: Optional list of tags
+            media_path: Optional path to the associated media
+            mood: Optional mood when creating the memory
+            importance: Importance level (1-5)
+            unlock_type: Type of unlock condition ('date', 'interval', 'random', etc.)
+
+        Returns:
+            The ID of the newly created memory
+        """
+        # Generate a unique ID for the memory
+        memory_id = str(uuid.uuid4())
+
+        # Ensure unlock_date is a string
+        if isinstance(unlock_date, datetime):
+            unlock_date = unlock_date.isoformat()
+
+        # Get the current date and teme
+        created_date = datetime.now().isoformat()
+
+        # Store unlock conditions as JSON if they exist
+        unlock_conditions = None
+        if unlock_type != "date":
+            unlock_conditions = json.dumps({
+                "type": unlock_type,
+            })
+            
+        # Insert the memory into the database
+        conn = self.get_db_connection()
+        cursor = conn.cursor()
+        cursor.execute('''
+        INSERT INTO memories
+        (id, title, content, media_path, created_date, unlock_date,
+        unlock_type, unlock_conditions, category, mood, importance)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        ''', (memory_id, title, content, media_path, created_date, unlock_date,
+            unlock_type, unlock_conditions, category, mood, importance))
+        
+        # Add tags if provided
+        if tags:
+            for tag in tags:
+                cursor.execute('''
+                    INSERT INTO memory_tags (memory_id, tag) VALUES (?, ?)
+                ''', (memory_id, tag))
+        
+        conn.commit()
+        conn.close()
+        return memory_id
 
