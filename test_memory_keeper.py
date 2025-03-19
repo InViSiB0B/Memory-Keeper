@@ -27,16 +27,23 @@ class TestMemoryKeeper(unittest.TestCase):
 
     def tearDown(self):
         """Clean up after each test."""
-        # Close any open connections
         try:
-            # Force the garbage collector to run, which might help close connections
+            # Force close any open connections
+            self.memory_keeper = None  # Remove reference to memory keeper
+            
+            # Force the garbage collector to run
             import gc
             gc.collect()
+            
+            # Wait a brief moment to allow OS to release file locks
+            import time
+            time.sleep(0.1)
             
             # Try to remove the test database
             if os.path.exists(self.test_db_path):
                 try:
                     os.remove(self.test_db_path)
+                    print(f"Successfully removed {self.test_db_path}")
                 except PermissionError:
                     print(f"Warning: Could not remove test database {self.test_db_path}. It may still be in use.")
         except Exception as e:

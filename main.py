@@ -210,4 +210,121 @@ class MemoryKeeper:
         conn.commit()
         conn.close()
         return memory_id
+    
+    def get_upcoming_memories(self, limit = 10):
+        """
+        Get memories that will unlock soon but haven't yet.
 
+        Args:
+            limit: Maximum number of memories to return
+
+        Returns:
+            List of memory dictionaries
+        """
+        conn = self.get_db_connectio()
+        cursor = conn.cursor()
+
+        cursor.execute('''
+            SELECT id, title, created_date, unlock_date, category, importance
+            FROM memories
+            WHERE is_unlocked = 0 AN unlock_date > ?
+            ORDER BY unlock_date ASC
+            LIMIT ?
+        ''', (datetime.now().isoformat(), limit))
+
+        columns = ["id", "title", "created_date", "unlock_date", "category", "importance"]
+        memories = [dict(zip(columns, row)) for row in cursor.fetchall()]
+
+        conn.close()
+        return memories
+    
+    def unlock_memory(self, memory_id):
+        """
+        Mark a memory as unlocked.
+
+        Args:
+            memory_id: ID of the memory to unlock
+
+        Returns:
+            Boolean indicating success
+        """
+        conn = self.get_db_connection()
+        cursor = conn.cursor()
+
+        cursor.execute('''
+            UPDATE memories
+            SET is_unlocked = 1
+            WHERE id = ?
+        ''', (memory_id,))
+
+        success = cursor.rowcount > 0
+        conn.commit()
+        conn.close()
+
+        return success
+    
+    def add_response (self, memory_id, response_content, mood = None):
+        """
+        Add a response to an unlocked memory.
+
+        Args:
+            memory_id: ID of the memory being responded to
+            response_content: Text content of the response
+            mood: Optional mood when creating the response
+
+        Returns:
+            The ID of the newly created response
+        """
+        response_id = str(uuid.uuid4())
+        response_date = datetime.now().isoformat()
+
+        conn = self.get_db_connection()
+        cursor = conn.cursor()
+
+        cursor.execute('''
+            INSERT INTO responses
+            (id, memory_id, response_content, response_date, response_mood)
+            VALUES (?, ?, ?, ?, ?)
+        ''', (response_id, memory_id, response_content, response_date, mood))
+
+        conn.commit()
+        conn.close()
+
+        return response_id
+    
+    def get_memory_count(self):
+        """Get counts of total, locked, and unlocked memories."""
+        conn = self.get_db_connection()
+        cursor = conn.cursor()
+
+        cursor.execute("SELECT COUNT(*) FROM memories")
+        total_count = cursor.fetchone()[0]
+
+        cursor.execute("SELECT COUNT(*) FROM memories WHERE is_unlocked = 0")
+        locked_count = cursor.fetchone()[0]
+
+        cursor.execute("SELECT COUNT(*) FROM memories WHERE is_unlocked = 1")
+        unlocked_count = cursor.fetchone()[0]
+
+        conn.close()
+
+        return 
+        {
+            "total": total_count,
+            "locked": locked_count,
+            "unlocked": unlocked_count
+        }
+
+    def get_categories(self):
+        """Get all available categories."""
+        conn = self.get_db_connection()
+        cursor = conn.cursor()
+
+        cursor.execute("SELECT id, name, description, icon FROM categories")
+
+        columns = ["id", "name", "description", "icon"]
+        categories = [dict(zip(columns, row)) for row in cursor.fetchall()]
+
+        conn.close()
+        return categories
+    
