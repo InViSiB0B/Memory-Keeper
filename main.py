@@ -355,6 +355,78 @@ class MemoryKeeper:
         conn.close()
         return memories
     
+    def get_locked_memories(self, category_id = None, sort_field = "unlock_date", 
+                            sort_order = "ASC", search_text = "", limit = 50):
+        """
+        Get locked memories with filtering and sorting options.
+
+        Args:
+            category_id: Filter by category ID (None for all categories)
+            sort_field: Field to sort by (unlock_date, created_date, importance)
+            sort_order: Sort direction (ASC or DESC)
+            search_text: Filter by title or tags containing this text
+            limit: Maximum number of memories to return
+
+        Returns:
+            List of memory dictionaries
+        """
+        conn = self.get_db_connection()
+        conn.row_factory = sqlite3.Row # This makes the rows accessible by column name
+        cursor = conn.cursor()
+
+        # Start building the query
+        query = """
+            SELECT m.id, m.title, m.created_date, m.unlock_date,
+                    m.category, m.importance, m.mood, GROUP_CONCAT(mt.tag) as tags
+            FROM memories m
+            LEFT JOIN memory_tags mt ON m.id = mt.memory_id
+            WHERE m.is_unlocked = 0
+        """
+
+        # Parameters for the query
+        params = []
+
+        # Add category filter if specified
+        if category_id:
+            query += " AND m.category = ?"
+            params.append(category_id)
+        
+        # Add searc filter if specified
+        if search_text:
+            query += """ AND (
+                LOWER(m.title) LIKE ?
+                OR EXISTS (
+                    SELECT 1 FROM memory_tags
+                    WHERE memory_id = m.id AND LOWER(tag) LIKE?
+                )
+            )"""
+            search_param = f"%{search_text}%"
+            params.extend([search_param, search_param])
+
+        # Group by memory ID to combine tags
+        query += " GROUP by m.id"
+
+        # Add sorting
+        query += f" ORDER by m.{sort_field} {sort_order}"
+
+        #Add limit
+        query += " LIMIT ?"
+        params.append(limit)
+
+        cursor.execute(query, params)
+
+        #Convert to list of dictionaries
+        memories = []
+        for row in cursor.fetchall():
+            memory = dict(row)
+            # Convert tags from comma-separated string to list if not None
+            if memory.get("tags"):
+                memory["tags"] = memory["tags"].split(",")
+            memories.append(memory)
+        
+        conn.close()
+        return memories
+    
 class MemoryKeeperApp(QMainWindow):
     """Main application window for MemoryKeeper."""
 
@@ -586,17 +658,228 @@ class MemoryKeeperApp(QMainWindow):
         tab = QWidget()
         layout = QVBoxLayout(tab)
 
-        # Placeholder - This will eventually show all locked memories
-        info_label = QLabel("Your Memory Vault - Where your memories are securely stored until unlock time")
-        info_label.setWordWrap(True)
+        # Header section
+        header_label = QLabel("Your Memory Vault")
+        header_label.setFont(QFont("Arial", 14, QFont.Bold))
+        header_label.setAlignment(Qt.AlignCenter)
 
-        # This tab will be implemented with a scrollable list of memory cards
-        under_construction = QLabel("This tab is under construction")
+        description_label = QLabel(
+            "This is where you memories are securely stored until their unlock time. "
+            "Browse through your future surprised, but remember - you can't peek "
+            "inside until the time is right!"
+        )
+        description_label.setWordWrap(True)
 
-        layout.addWidget(info_label)
-        layout.addWidget(under_construction)
+        layout.addWidget(header_label)
+        layout.addWidget(description_label)
 
+        # Filter and search section
+        filter_group = QGroupBox("Filter Memories")
+        filter_layout = QHBoxLayout(filter_group)
+
+        # Category filter
+        category_label = QLabel("Category:")
+        self.vault_category_filter = QComboBox()
+        self.vault_category_filter.addItem("All Categories", None)
+
+        # Populate with categories from database
+        categories = self.memory_keeper.get_categories()
+        for category in categories:
+            self.vault_category_filter.addItem(category["name"], category["id"])
+
+        # Sort options
+        sort_label = QLabel("Sort by:")
+        self.vault_sort_combo = QComboBox()
+        self.vault_sort_combo.addItems(["Unlock Date (Soonest)", "Unlock Date (Latest)", 
+                                        "Creation Date (Newest)", "Creation Date (Oldest)",
+                                         "Importance (Highest)", "Importance (Lowest)"])
+        
+        # Connect filters to update function
+        self.vault_category_filter.currentIndexChanged.connect(self.refresh_vault_memories)
+        self.vault_sort_combo.currentIndexChanged.connect(self.refresh_vault_memories)
+
+        # Search box
+        self.vault_search_box = QLineEdit()
+        self.vault_search_box.setPlaceholderText("Search memories by title or tags...")
+        self.vault_search_box.textChanged.connect(self.refresh_vault_memories)
+
+        # Arrange filter widgets
+        filter_layout.addWidget(category_label)
+        filter_layout.addWidget(self.vault_category_filter)
+        filter_layout.addWidget(sort_label)
+        filter_layout.addWidget(self.vault_sort_combo)
+
+        layout.addWidget(filter_group)
+        layout.addWidget(self.vault_search_box)
+
+        # Scrollable area for memory cards
+        scroll_area = QScrollArea()
+        scroll_area.setWidgetResizable(True)
+        scroll_content = QWidget()
+
+        self.vault_memories_layout = QVBoxLayout(scroll_content)
+        self.vault_memories_layout.setAlignment(Qt.AlignTop)
+
+        scroll_area.setWidget(scroll_content)
+        layout.addWidget(scroll_area, 1)
+
+        # Initial load of memories
+        self.refresh_vault_memories()
+    
         return tab
+    
+    def refresh_vault_memories(self):
+        """Refresh the list of memories in the vault tab based on the current filters."""
+        # Clear existing memory cards
+        for i in reversed(range(self.vault_memories_layout.count())):
+            widget = self.vault_memories_layout.itemAt(i).widget()
+            if widget:
+                widget.deleteLater()
+
+        # Get filter values
+        category_id = self.vault_category_filter.currentData()
+        sort_option = self.vault_sort_combo.currentText()
+        search_text = self.vault_search_box.text().lower()
+
+        # Get locked memories with appropriate filters
+        memories = self.get_filtered_locked_memories(category_id, sort_option, search_text)
+
+        if memories:
+            # Create a memory card for each memory
+            for memory in memories:
+                memory_card = self.create_memory_card(memory)
+                self.vault_memories_layout.addWidget(memory_card)
+        else:
+            # Show a message if no memories are found
+            no_memories_label = QLabel("No locked memories found with the current filters.")
+            no_memories_label.setAlignment(Qt.AlignCenter)
+            self.vault_memories_layout.addWidget(no_memories_label)
+
+    def get_filtered_locked_memories(self, category_id = None, sort_option = "Unlock Date (Soonest)", search_text = ""):
+        """
+        Get locked memories from the database with filtering and sorting.
+
+        Args:
+            category_id: Filter by category ID (None for all categories)
+            sort_option: How to sort the results
+            search_text: Filter by title or tags containing this text
+
+        Returns:
+            List of the memory dictionaries
+        """
+        
+        # Convert sort option to parameters for the query
+        sort_field = "unlock_date"
+        sort_order = "ASC"
+
+        if "Creation Date" in sort_option:
+            sort_field = "created_date"
+        elif "Importance" in sort_option:
+            sort_field = "importance"
+            sort_order = "DESC"
+
+        if "Latest" in sort_option or "Oldest" in sort_option or "Newest" in sort_option:
+            sort_order = "DESC"
+
+        return self.memory_keeper.get_locked_memories(
+            category_id = category_id,
+            sort_field = sort_field,
+            sort_order = sort_order,
+            search_text = search_text
+        )
+
+    def create_memory_card(self, memory):
+        """
+        Create a card widget for a locked memory.
+
+        Args:
+            memory: Dictionary containing memory information
+
+        Returns:
+            QFrame widget representing the memory
+        """
+        # Create card frame
+        card = QFrame()
+        card.setFrameShape(QFrame.StyledPanel)
+        card.setFrameShadow(QFrame.Raised)
+        card.setStyleSheet(""""
+            QFrame {
+                border: 1px solid #CCCCCC;
+                border-radius: 8px;
+                background-color: #F8F8F8;
+                margin: 5px;
+            }
+        """)
+
+        # Create layout for the new card
+        card_layout = QVBoxLayout(card)
+
+        # Format dates
+        created_date = datetime.fromisoformat(memory["created_date"]).strftime("%M/%D/%Y")
+        unlock_date = datetime.fromisoformat(memory["unlock_date"]).strftime("%M/%D%Y")
+
+        # Days until unlock
+        days_until = (datetime.fromisoformat(memory["unlock_date"]) - datetime.now()).days
+        days_text = f"{days_until} days remaining" if days_until > 0 else "Unlocks today!"
+
+        # Create header with title
+        title_label = QLabel(memory["title"])
+        title_label.setFont(QFont("Arial", 12, QFont.Bold))
+
+        # Info section
+        info_layout = QHBoxLayout()
+        
+        # Left side info
+        left_info = QVBoxLayout()
+        created_label = QLabel(f"Created: {created_date}")
+        unlock_label = QLabel(f"Unlocks: {unlock_date}")
+        left_info.addWidget(created_label)
+        left_info.addWidget(unlock_label)
+
+        # Right side info
+        right_info = QVBoxLayout()
+        countdown_label = QLabel(days_text)
+        countdown_label.setStyleSheet("font-weight: bold; color: #2C6694;")
+
+        # Get category name if available
+        category_name = "Uncategorized"
+        if memory.get("category"):
+            categories = self.memory_keeper.get_categories()
+            for category in categories:
+                if category["id"] == memory["category"]:
+                    category_name = category["name"]
+                    break
+
+        category_label = QLabel(f"Category: {category_name}")
+        right_info.addWidget(countdown_label)
+        right_info.addWidget(category_label)
+
+        # Add left and right info to the info layout
+        info_layout.addLayout(left_info)
+        info_layout.addStretch()
+        info_layout.addLayout(right_info)
+
+        # Add components to card layout
+        card_layout.addWidget(title_label)
+        card_layout.addLayout(info_layout)
+
+        # If the memory has importance, show stars
+        if "importance" in memory and memory ["importance"]:
+            importance = int(memory["importance"])
+            stars = "★" * importance + "★" * (5 - importance)
+            importance_label = QLabel(stars)
+            importance_label.setStyleSheet("color:gold;")
+            card_layout.addWidget(importance_label)
+
+        # Add Tags if available
+        if memory.get("tags"):
+            tags_text = ", ".join(memory["tags"])
+            tags_label = QLabel(f"Tags: {tags_text}")
+            tags_label.setStyleSheet("font-style: italic; color: #666666;")
+            card_layout.addWidget(tags_label)
+
+        return card
+
     
     def create_unlocked_tab(self):
         """Create the tab for viewing unlocked memories."""
