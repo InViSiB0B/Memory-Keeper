@@ -520,7 +520,7 @@ class MemoryKeeper:
         row = cursor.fetchone()
 
         if not row:
-            conn.closer()
+            conn.close()
             return None
         
         memory = dict(row)
@@ -557,12 +557,56 @@ class MemoryKeeper:
             FROM responses
             WHERE memory_id = ?
             ORDER BY response_date DESC
-        """, (memory_id))
+        """, (memory_id,))
 
         responses = [dict(row) for row in cursor.fetchall()]
 
         conn.close()
         return responses
+    
+    def delete_memory(self, memory_id):
+        """
+        Delete a memory and all its associated data (tags and responses).
+
+        Args:
+            memory_id: ID of the memory to delete
+
+        Returns:
+            Boolean indicating success
+        """
+
+        conn = self.get_db_connection()
+        cursor = conn.cursor()
+
+        try:
+            # Start a transaction
+            conn.execute("BEGIN TRANSACTION")
+
+            # Delete associated responses
+            cursor.execute("DELETE FROM responses WHERE memory_id = ?", (memory_id,))
+
+            # Delete associated tags
+            cursor.execute("DELETE FROM memory_tags WHERE memory_id = ?", (memory_id,))
+
+            # Delete the memory itself
+            cursor.execute("DELETE FROM memories WHERE id = ?", (memory_id,))
+
+            # Check if any rows were affected
+            success = cursor.rowcount > 0
+
+            # Commit the transaction
+            conn.commit()
+
+            return success
+        
+        except Exception as e:
+            # If anything goes wrong, roll back the transaction
+            conn.rollback()
+            print(f"Error deleting memory: {e}")
+            return False
+        
+        finally:
+            conn.close()
 
 class MemoryKeeperApp(QMainWindow):
     """Main application window for MemoryKeeper."""
@@ -952,9 +996,35 @@ class MemoryKeeperApp(QMainWindow):
         days_until = (datetime.fromisoformat(memory["unlock_date"]) - datetime.now()).days
         days_text = f"{days_until} days remaining" if days_until > 0 else "Unlocks today!"
 
-        # Create header with title
+        # Create header with title and actions
+        header_layout = QHBoxLayout()
+
         title_label = QLabel(memory["title"])
         title_label.setFont(QFont("Arial", 12, QFont.Bold))
+
+        # Container for action buttons
+        buttons_layout = QHBoxLayout()
+
+        # Add unlock button if the memory is ready to be unlocked
+        if days_until <= 0:
+            unlock_button = QPushButton("Unlock Now")
+            unlock_button.setStyleSheet("background-color: #E0FFE0;")
+            unlock_button.clicked.connect(lambda: self.unlock_and_view_memory(memory["id"]))
+            buttons_layout.addWidget(unlock_button)
+
+            # Change the days text
+            days_text = "Ready to unlock now!"
+        else:
+            days_text = f"{days_until} days remaining"
+
+        # Add delete button
+        delete_button = QPushButton("Delete")
+        delete_button.setStyleSheet("background-color: #FFE0E0;")
+        delete_button.clicked.connect(lambda: self.confirm_delete_memory(memory["id"], is_locked = True))
+        buttons_layout.addWidget(delete_button)
+
+        header_layout.addWidget(title_label, 1)
+        header_layout.addLayout(buttons_layout)
 
         # Info section
         info_layout = QHBoxLayout()
@@ -996,7 +1066,7 @@ class MemoryKeeperApp(QMainWindow):
         # If the memory has importance, show stars
         if "importance" in memory and memory ["importance"]:
             importance = int(memory["importance"])
-            stars = "★" * importance + "★" * (5 - importance)
+            stars = "★" * importance + "☆" * (5 - importance)
             importance_label = QLabel(stars)
             importance_label.setStyleSheet("color:gold;")
             card_layout.addWidget(importance_label)
@@ -1032,54 +1102,68 @@ class MemoryKeeperApp(QMainWindow):
 
         # Create a splitter for the main content
         splitter = QSplitter(Qt.Horizontal)
+        self.unlocked_splitter = splitter  # Store reference
 
         # Left side - List of unlocked memories
         left_widget = QWidget()
         left_layout = QVBoxLayout(left_widget)
-
+        left_layout.setContentsMargins(0, 0, 0, 0)  # Reduce margins
+        
         # Filter options
+        filter_layout = QHBoxLayout()
         filter_label = QLabel("Filter by:")
         self.unlocked_filter_combo = QComboBox()
-        self.unlocked_filter_combo.addItems(["All Unlocked", "Recent (Last 30 Days)",
-                                             "By Category", "With Responses", "Without Responses"])
-        self.unlocked_filter_combo.currentIndexChanged.connect(self.filter_unlocked_memories)
+        self.unlocked_filter_combo.addItems([
+            "All Unlocked", 
+            "Recent (Last 30 Days)",
+            "By Category", 
+            "With Responses", 
+            "Without Responses"
+        ])
+        filter_layout.addWidget(filter_label)
+        filter_layout.addWidget(self.unlocked_filter_combo, 1)  # Give it more space
+        left_layout.addLayout(filter_layout)
 
         # Category sub-filter (initially hidden)
         self.unlocked_category_filter = QComboBox()
         self.unlocked_category_filter.setVisible(False)
-        self.unlocked_category_filter.currentIndexChanged.connect(self.filter_unlocked_memories)
-
-        # Connect filter change to show/hide category filter
-        self.unlocked_filter_combo.currentIndexChanged.connect(self.toggle_category_filter)
+        left_layout.addWidget(self.unlocked_category_filter)
 
         # Memory list
         self.unlocked_memory_list = QListWidget()
         self.unlocked_memory_list.setSelectionMode(QListWidget.SingleSelection)
-        self.unlocked_memory_list.currentItemChanged.connect(self.display_unlocked_memory)
+        left_layout.addWidget(self.unlocked_memory_list, 1)  # Give it stretch
 
-        # Add widgets to the left layout
-        filter_layout = QHBoxLayout()
-        filter_layout.addWidget(filter_label)
-        filter_layout.addWidget(self.unlocked_filter_combo)
-        left_layout.addLayout(filter_layout)
-        left_layout.addWidget(self.unlocked_category_filter)
-        left_layout.addWidget(self.unlocked_memory_list)
+        # Connect signals AFTER creating widgets
+        self.unlocked_filter_combo.currentIndexChanged.connect(self.filter_unlocked_memories)
+        self.unlocked_category_filter.currentIndexChanged.connect(self.filter_unlocked_memories)
+        self.unlocked_filter_combo.currentIndexChanged.connect(self.toggle_category_filter)
+        self.unlocked_memory_list.currentItemChanged.connect(self.display_unlocked_memory)
 
         # Right side - Memory details and response area
         right_widget = QWidget()
         right_layout = QVBoxLayout(right_widget)
+        right_layout.setContentsMargins(0, 0, 0, 0)  # Reduce margins
 
-        # Scroll area for memory content
+        # Create a scroll area for memory content
         content_scroll = QScrollArea()
         content_scroll.setWidgetResizable(True)
+        self.unlocked_content_scroll = content_scroll  # Store reference
+
+        # Create content widget and layout
         content_widget = QWidget()
-        self.memory_content_layout = QVBoxLayout(content_widget)
+        self.unlocked_content_widget = content_widget  # Store reference
+        self.memory_content_layout = QVBoxLayout(content_widget)  # Store reference
+        self.memory_content_layout.setAlignment(Qt.AlignTop)  # Align to top
         content_scroll.setWidget(content_widget)
 
-        # Default content to show when no memory is selected
+        # Default content - shown when no memory is selected
         default_label = QLabel("Select a memory from the list to view its contents.")
         default_label.setAlignment(Qt.AlignCenter)
         self.memory_content_layout.addWidget(default_label)
+
+        # Add the content scroll area to the right layout
+        right_layout.addWidget(content_scroll, 3)  # Give content more space
 
         # Response section
         response_group = QGroupBox("Your Response")
@@ -1092,39 +1176,44 @@ class MemoryKeeperApp(QMainWindow):
 
         self.response_text_edit = QTextEdit()
         self.response_text_edit.setPlaceholderText("Type your response here...")
-        self.response_text_edit.setEnabled(False) # Disabled until a memory is selected
+        self.response_text_edit.setEnabled(False)  # Disabled until a memory is selected
 
+        mood_layout = QHBoxLayout()
         mood_label = QLabel("Your current mood:")
         self.response_mood_combo = QComboBox()
-        self.response_mood_combo.addItems(["Happy", "Reflective", "Surprised", "Nostalgic",
-                                           "Amused", "Grateful", "Inspider", "Other"])
-        self.response_mood_combo.setEnabled(False) # Disabled until a memory is selected
+        self.response_mood_combo.addItems([
+            "Happy", "Reflective", "Surprised", "Nostalgic",
+            "Amused", "Grateful", "Inspired", "Other"
+        ])
+        self.response_mood_combo.setEnabled(False)  # Disabled until a memory is selected
+        mood_layout.addWidget(mood_label)
+        mood_layout.addWidget(self.response_mood_combo, 1)
 
-        save_response_button = QPushButton("Save Response")
-        save_response_button.clicked.connect(self.save_memory_response)
-        save_response_button.setEnabled(False) # Disabled until a memory is selected
-        self.save_response_button = save_response_button # Store reference for enabling/disabling
+        self.save_response_button = QPushButton("Save Response")
+        self.save_response_button.setEnabled(False)  # Disabled until a memory is selected
+
+        # Connect signals AFTER creating widgets
+        self.save_response_button.clicked.connect(self.save_memory_response)
 
         # Add widgets to response layout
         response_layout.addWidget(response_label)
         response_layout.addWidget(self.response_text_edit)
-
-        mood_layout = QHBoxLayout()
-        mood_layout.addWidget(mood_label)
-        mood_layout.addWidget(self.response_mood_combo)
         response_layout.addLayout(mood_layout)
+        response_layout.addWidget(self.save_response_button)
 
-        response_layout.addWidget(save_response_button)
+        # Add the response section to the right layout
+        right_layout.addWidget(response_group, 1)
 
         # Add the left and right widgets to the splitter
         splitter.addWidget(left_widget)
         splitter.addWidget(right_widget)
 
-        # Set the initial sizes pf the splitter
-        splitter.setSizes([300, 500])
+        # Set the initial sizes of the splitter (40% left, 60% right)
+        total_width = 1000  # Just a reference, will be adjusted
+        splitter.setSizes([int(total_width * 0.4), int(total_width * 0.6)])
 
         # Add the splitter to the main layout
-        layout.addWidget(splitter, 1)
+        layout.addWidget(splitter, 1)  # Give it stretch
 
         # Store reference to the currently displayed memory
         self.current_memory_id = None
@@ -1133,6 +1222,9 @@ class MemoryKeeperApp(QMainWindow):
         self.populate_categories_filter()
         self.load_unlocked_memories()
 
+        # Store a reference to this tab
+        self.unlocked_tab_widget = tab
+        
         return tab
     
     def toggle_category_filter(self):
@@ -1225,39 +1317,73 @@ class MemoryKeeperApp(QMainWindow):
             previous: The previously selected item
         """
 
-        # Clear current content
-        for i in reversed(range(self.memory_content_layout.count())):
-            widget = self.memory_content_layout.itemAt(i).widget()
-            if widget:
-                widget.deleteLater()
+        # Clear the current memory ID
+        self.current_memory_id = None
         
-        # Enable or disable response controls based on selection
-        has_selection = current is not None and current.flags() & Qt.ItemIsSelectable
-        self.response_text_edit.setEnabled(has_selection)
-        self.response_mood_combo.setEnabled(has_selection)
-        self.save_response_button.setEnabled(has_selection)
-
-        if not has_selection:
+        # Clear the response inputs regardless of selection
+        if hasattr(self, 'response_text_edit'):
+            self.response_text_edit.clear()
+            self.response_text_edit.setEnabled(False)
+        
+        if hasattr(self, 'response_mood_combo'):
+            self.response_mood_combo.setEnabled(False)
+        
+        if hasattr(self, 'save_response_button'):
+            self.save_response_button.setEnabled(False)
+        
+        # Make sure we have a content layout to work with
+        if not hasattr(self, 'memory_content_layout') or not self.memory_content_layout:
+            # Create a new widget and layout
+            self.unlocked_content_widget = QWidget()
+            self.memory_content_layout = QVBoxLayout(self.unlocked_content_widget)
+            if hasattr(self, 'unlocked_content_scroll'):
+                self.unlocked_content_scroll.setWidget(self.unlocked_content_widget)
+        
+        # Clear current content safely
+        while self.memory_content_layout.count():
+            item = self.memory_content_layout.takeAt(0)
+            if item and item.widget():
+                item.widget().deleteLater()
+        
+        # Check if we have a valid selection
+        if not current or not (current.flags() & Qt.ItemIsSelectable):
             # Show default message
             default_label = QLabel("Select a memory from the list to view its contents.")
             default_label.setAlignment(Qt.AlignCenter)
             self.memory_content_layout.addWidget(default_label)
-            self.current_memory_id = None
             return
         
         # Get memory ID from the selected item
-        memory_id = current.data(Qt.UserRole)
-        self.current_memory_id = memory_id
-
-        # Get the full memory details
-        memory = self.memory_keeper.get_memory_by_id(memory_id)
-        if not memory:
-            error_label = QLabel("Error: Could not load memory details.")
+        try:
+            memory_id = current.data(Qt.UserRole)
+            self.current_memory_id = memory_id
+            
+            # Get the full memory details
+            memory = self.memory_keeper.get_memory_by_id(memory_id)
+            if not memory:
+                error_label = QLabel("Error: Could not load memory details.")
+                self.memory_content_layout.addWidget(error_label)
+                return
+            
+            # Set up response inputs now that we have a valid memory
+            if hasattr(self, 'response_text_edit'):
+                self.response_text_edit.setEnabled(True)
+            
+            if hasattr(self, 'response_mood_combo'):
+                self.response_mood_combo.setEnabled(True)
+            
+            if hasattr(self, 'save_response_button'):
+                self.save_response_button.setEnabled(True)
+            
+            # Display the memory content
+            self.display_memory_content(memory)
+        
+        except Exception as e:
+            print(f"Error displaying memory: {e}")
+            error_label = QLabel(f"An error occurred: {str(e)}")
+            error_label.setWordWrap(True)
+            error_label.setStyleSheet("color: red;")
             self.memory_content_layout.addWidget(error_label)
-            return
-
-        # Create and add memory content widgets
-        self.display_memory_content(memory)
 
     def display_memory_content(self, memory):
         """
@@ -1266,127 +1392,113 @@ class MemoryKeeperApp(QMainWindow):
         Args:
             memory: Dictionary with memory details
         """
-        # Memory Title
-        title_label = QLabel(memory["title"])
-        title_label.setFont(QFont("Arial", 16, QFont.Bold))
-        title_label.setAlignment(Qt.AlignCenter)
-        self.memory_content_layout.addWidget(title_label)
+        try:
+            # Memory Title
+            title_label = QLabel(memory["title"])
+            title_label.setFont(QFont("Arial", 16, QFont.Bold))
+            self.memory_content_layout.addWidget(title_label)
+            
+            # Delete button
+            delete_button = QPushButton("Delete Memory")
+            delete_button.setStyleSheet("background-color: #FFCCCC;")
+            delete_button.clicked.connect(lambda: self.confirm_delete_memory(memory["id"], is_locked=False))
+            self.memory_content_layout.addWidget(delete_button)
+            
+            # Memory metadata
+            created_date = datetime.fromisoformat(memory["created_date"]).strftime("%B %d, %Y")
+            unlock_date = datetime.fromisoformat(memory["unlock_date"]).strftime("%B %d, %Y")
+            
+            metadata_label = QLabel(f"Created: {created_date} | Unlocked: {unlock_date}")
+            self.memory_content_layout.addWidget(metadata_label)
+            
+            # Get category name
+            category_name = "Uncategorized"
+            if memory.get("category"):
+                categories = self.memory_keeper.get_categories()
+                for category in categories:
+                    if category["id"] == memory["category"]:
+                        category_name = category["name"]
+                        break
+            
+            category_label = QLabel(f"Category: {category_name}")
+            self.memory_content_layout.addWidget(category_label)
+            
+            # Show original mood if available
+            if memory.get("mood"):
+                mood_label = QLabel(f"Your mood when writing: {memory['mood']}")
+                self.memory_content_layout.addWidget(mood_label)
+            
+            # Importance indicator if available
+            if memory.get("importance"):
+                importance = int(memory["importance"])
+                stars = "★" * importance + "☆" * (5 - importance)
+                importance_label = QLabel(f"Importance: {stars}")
+                self.memory_content_layout.addWidget(importance_label)
+            
+            # Add a separator
+            separator = QFrame()
+            separator.setFrameShape(QFrame.HLine)
+            separator.setFrameShadow(QFrame.Sunken)
+            self.memory_content_layout.addWidget(separator)
+            
+            # Memory content
+            content_label = QLabel(memory["content"])
+            content_label.setWordWrap(True)
+            content_label.setTextInteractionFlags(Qt.TextSelectableByMouse)
+            content_label.setStyleSheet("font-size: 12pt; margin: 10px;")
+            self.memory_content_layout.addWidget(content_label)
+            
+            # Add a separator before responses
+            separator2 = QFrame()
+            separator2.setFrameShape(QFrame.HLine)
+            separator2.setFrameShadow(QFrame.Sunken)
+            self.memory_content_layout.addWidget(separator2)
+            
+            # Previous responses section
+            responses_label = QLabel("Your Previous Responses:")
+            responses_label.setFont(QFont("Arial", 12, QFont.Bold))
+            self.memory_content_layout.addWidget(responses_label)
+            
+            # Get responses for this memory
+            responses = self.memory_keeper.get_responses_for_memory(memory["id"])
+            
+            if responses:
+                for response in responses:
+                    response_date = datetime.fromisoformat(response["response_date"]).strftime("%B %d, %Y")
+                    date_label = QLabel(f"Response from {response_date}")
+                    date_label.setStyleSheet("font-weight: bold;")
+                    self.memory_content_layout.addWidget(date_label)
+                    
+                    # Response mood if available
+                    if response.get("response_mood"):
+                        mood_label = QLabel(f"Mood: {response['response_mood']}")
+                        self.memory_content_layout.addWidget(mood_label)
+                    
+                    # Response content
+                    content_text = QLabel(response["response_content"])
+                    content_text.setWordWrap(True)
+                    self.memory_content_layout.addWidget(content_text)
+                    
+                    # Add a small spacer
+                    spacer = QFrame()
+                    spacer.setFrameShape(QFrame.HLine)
+                    spacer.setFrameShadow(QFrame.Sunken)
+                    self.memory_content_layout.addWidget(spacer)
+            else:
+                no_responses = QLabel("You haven't responded to this memory yet.")
+                no_responses.setAlignment(Qt.AlignCenter)
+                no_responses.setStyleSheet("font-style: italic; color: #666666;")
+                self.memory_content_layout.addWidget(no_responses)
+            
+            # Add a final stretch to push everything up
+            self.memory_content_layout.addStretch()
 
-        # Memory metadata
-        created_date = datetime.fromisoformat(memory["created_date"]).strftime("%B %d, %Y")
-        unlock_date = datetime.fromisoformat(memory["unlock_date"]).strftime("%B %d, %Y")
-
-        metadata_frame = QFrame()
-        metadata_frame.setFrameShape(QFrame.StyledPanel)
-        metadata_layout = QHBoxLayout(metadata_frame)
-
-        # Left side - dates
-        dates_layout = QVBoxLayout()
-        created_label = QLabel(f"Created: {created_date}")
-        unlock_label = QLabel(f"Unlocked: {unlock_date}")
-        dates_layout.addWidget(created_label)
-        dates_layout.addWidget(unlock_label)
-
-        # Right side - category and mood
-        info_layout = QVBoxLayout()
-
-        # Get category name
-        category_name = "Uncategorized"
-        if memory.get("category"):
-            categories = self.memory_keeper.get_categories()
-            for category in categories:
-                if category["id"] == memory["category"]:
-                    category_name = category["name"]
-                    break
-        
-        category_label = QLabel(f"Category: {category_name}")
-
-        # Show original mood if available
-        mood_text = "Unknown"
-        if memory.get("mood"):
-            mood_text = memory["mood"]
-
-        mood_label = QLabel(f"Your mood when writing: {mood_text}")
-
-        info_layout.addWidget(category_label)
-        info_layout.addWidget(mood_label)
-
-        # Add layouts to metadata frame
-        metadata_layout.addLayout(dates_layout)
-        metadata_layout.addStretch()
-        metadata_layout.addLayout(info_layout)
-
-        self.memory_content_layout.addWidget(metadata_frame)
-
-        # Importance indicator if available
-        if memory.get("importance"):
-            importance = int(memory["importance"])
-            stars = "★" * importance + "★" * (5 - importance)
-            importance_label = QLabel(f"Importance: {stars}")
-            importance_label.setStyle("color: gold;")
-            importance_label.setAlignment(Qt.AlignCenter)
-            self.memory_content_layout.addWidget(importance_label)
-
-        # Add a separator
-        separator = QFrame()
-        separator.setFrameShape(QFrame.HLine)
-        separator.setFrameShadow(QFrame.Sunken)
-        self.memory_content_layout.addWidget(separator)
-
-        # Memory content
-        content_label = QLabel(memory["content"])
-        content_label.setWordWrap(True)
-        content_label.setTextInteractionFlags(Qt.TextSelectableByMouse)
-        content_label.setStyleSheet("font-size: 12pt; margin: 10px;")
-
-        self.memory_content_layout.addWidget(content_label)
-
-        # Add a separator before responses
-        separator2 = QFrame()
-        separator2.setFrameShape(QFrame.HLine)
-        separator2.setFrameShadow(QFrame.Sunken)
-        self.memory_content_layout.addWidget(separator2)
-
-        # Previous responses section
-        responses_label = QLabel("Your Previous Responses:")
-        responses_label.setFont(QFont("Arial", 12, QFont.Bold))
-        self.memory_content_layout.addWidget(responses_label)
-
-        # Get responses for this memory
-        responses = self.memory_keeper.get_responses_for_memory(memory["id"])
-
-        if responses:
-            for response in responses:
-                response_frame = QFrame()
-                response_frame.setFrameShape(QFrame.StyledPanel)
-                response_layout = QVBoxLayout(response_frame)
-
-                # Response date
-                response_date = datetime.fromisoformat(response["reponse_date"]).strftime("%B %d, %Y")
-                date_label = QLabel(f"Response from {response_date}")
-                date_label.setStyleSheet("font-weight: bold;")
-
-                # Response mood if available
-                if response.get("response_mood"):
-                    date_label.setText(f"Response from {response_date} (Mood: {response['response_mood']})")
-
-                # Reponse content
-                content_text = QLabel(response["response_content"])
-                content_text.setWordWrap(True)
-
-                response_layout.addWidget(date_label)
-                response_layout.addWidget(content_text)
-
-                self.memory_content_layout.addWidget(response_frame)
-
-        else:
-            no_responses = QLabel("You haven't responded to this memory yet.")
-            no_responses.setAlignment(Qt.AlignCenter)
-            no_responses.setStyleSheet("font-style: italic; color: #666666;")
-            self.memory_content_layout.addWidget(no_responses)
-
-        # Add a final stretch to push everything up
-        self.memory_content_layout.addStretch()
+        except Exception as e:
+            print(f"Error in display_memory_content: {str(e)}")
+            error_label = QLabel(f"Error displaying memory content: {str(e)}")
+            error_label.setStyleSheet("color: red;")
+            error_label.setWordWrap(True)
+            self.memory_content_layout.addWidget(error_label)
 
     def save_memory_response(self):
         """Save the user's response to the current memory."""
@@ -1484,17 +1596,28 @@ class MemoryKeeperApp(QMainWindow):
         """Check if there are any memories ready to be unlocked."""
         unlockable_memories = self.memory_keeper.get_unlockable_memories()
 
+         # First, unlock all the memories that are ready
+        unlocked_count = 0
         if unlockable_memories:
+            for memory in unlockable_memories:
+                success = self.memory_keeper.unlock_memory(memory["id"])
+                if success:
+                    unlocked_count += 1
+
+        # Only show the notification if we've actually unlocked some memories
+        if unlocked_count > 0:
             msg = QMessageBox()
             msg.setIcon(QMessageBox.Information)
-            msg.setWindowTitle("Memories Ready to Unlock")
-            msg.setText(f"You have {len(unlockable_memories)} memories ready to unlock!")
+            msg.setWindowTitle("Memories Unlocked")
+            msg.setText(f"{unlocked_count} memories have been unlocked!")
             msg.setInformativeText("Would you like to view them now?")
             msg.setStandardButtons(QMessageBox.Yes | QMessageBox.No)
 
             if msg.exec_() == QMessageBox.Yes:
                 # Switch to the unlocked memories tab
                 self.tabs.setCurrentIndex(3)
+                # Refresh the unlocked memories list
+                self.load_unlocked_memories()
 
     def refresh_dashboard(self):
         """Refresh the dashboard with updated data."""
@@ -1504,6 +1627,91 @@ class MemoryKeeperApp(QMainWindow):
         self.tabs.removeTab(0)
         self.tabs.insertTab(0, new_dashboard, "Dashboard")
         self.tabs.setCurrentIndex(0)
+
+    def confirm_delete_memory(self, memory_id, is_locked = True):
+        """
+        Show confirmation dialog and delete memory if confirmed.
+
+        Args:
+            memory_id: ID of memory to delete
+            is_locked: Whether the memory is in the locked vault (True) or in the unlocked tab (False)
+        """
+        confirm = QMessageBox()
+        confirm.setIcon(QMessageBox.Warning)
+        confirm.setWindowTitle("Confirm Deletion")
+        confirm.setText("Are you sure you want to delete this memory?")
+        confirm.setInformativeText("This action cannot be undone. All content and responses associated with "
+                                    "this memory will be permanently deleted.")
+        confirm.setStandardButtons(QMessageBox.Yes | QMessageBox.No)
+        confirm.setDefaultButton(QMessageBox.No)
+
+        if confirm.exec_() == QMessageBox.Yes:
+            # User confirmed deletion
+            success = self.memory_keeper.delete_memory(memory_id)
+
+            if success:
+                QMessageBox.information(self, "Memory Deleted",
+                                        "The memory has been permanently deleeted.")
+                
+                # Refresh the appropriate tab
+                if is_locked:
+                    self.refresh_vault_memories()
+                else:
+                    # For unlocked tab, clear the display and refresh list
+                    self.current_memory_id = None
+                    self.load_unlocked_memories()
+
+                    # Clear the reponse area
+                    self.response_text_edit.clear()
+                    self.response_text_edit.setEnabled(False)
+                    self.response_mood_combo.setEnabled(False)
+                    self.save_response_button.setEnabled(False)
+
+                    # Clear current selection
+                    self.unlocked_memory_list.clearSelection()
+
+            else:
+                QMessageBox.critical(self, "Error,"
+                                    "Failed to delete the memory. Please try again.")
+                
+    def unlock_and_view_memory(self, memory_id):
+        """
+        Unlock a memory and switch to the unlocked tab to view it.
+
+        Args:
+            memory_id: ID of the memory to unlock
+        """
+        try:
+            # Unlock the memory
+            success = self.memory_keeper.unlock_memory(memory_id)
+
+            if success:
+                QMessageBox.information(self, "Memory Unlocked",
+                                        "The memory has been unlocked and is now available to view.")
+                
+                # Refresh the vault to remove the unlocked memory
+                self.refresh_vault_memories()
+                
+                # Switch to the unlocked memories tab
+                self.tabs.setCurrentIndex(3)
+
+                # Refresh the unlocked memories list
+                self.load_unlocked_memories()
+
+                # Try to select and display the newly unlocked memory
+                for i in range(self.unlocked_memory_list.count()):
+                    item = self.unlocked_memory_list.item(i)
+                    if item.date(Qt.UserRole) == memory_id:
+                        self.unlocked_memory_list.setCurrentItem(item)
+                        break
+            
+            else:
+                QMessageBox.critical(self, "Error",
+                                    "Failed to unlock the memory. Please try again.")
+        except Exception as e:
+            print(f"Error unlocking memory: {e}")
+            QMessageBox.critical(self, "Error",
+                                 f"An error occurred: {str(e)}")
 
 def main():
     """Main entry point for MemoryKeeper"""
