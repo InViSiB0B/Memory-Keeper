@@ -1,8 +1,11 @@
 from datetime import datetime, timedelta
 import json
+import shutil
 import sqlite3
 import sys
+import tempfile
 import uuid
+import zipfile
 from PyQt5.QtWidgets import (QApplication, QMainWindow, QWidget, QVBoxLayout,
                              QHBoxLayout, QLabel, QPushButton, QTextEdit,
                              QListWidget, QCalendarWidget, QFileDialog,
@@ -732,7 +735,10 @@ class MemoryKeeperApp(QMainWindow):
 
         # Quick actions section
         actions_group = QGroupBox("Quick Actions")
-        actions_layout = QHBoxLayout(actions_group)
+        actions_layout = QVBoxLayout(actions_group)
+
+        # Main actions row (first row)
+        main_actions = QHBoxLayout()
 
         create_button = QPushButton("Create New Memory")
         create_button.clicked.connect(lambda: self.tabs.setCurrentIndex(1))
@@ -740,8 +746,28 @@ class MemoryKeeperApp(QMainWindow):
         browse_button = QPushButton("Browse Memory Vault")
         browse_button.clicked.connect(lambda: self.tabs.setCurrentIndex(2))
 
-        actions_layout.addWidget(create_button)
-        actions_layout.addWidget(browse_button)
+        main_actions.addWidget(create_button)
+        main_actions.addWidget(browse_button)
+
+        # Add the first row to the actions layout
+        actions_layout.addLayout(main_actions)
+
+        # Import/Export row (second row)
+        import_export_actions = QHBoxLayout()
+
+        export_button = QPushButton("Export Memories")
+        export_button.setToolTip("Create a backup of all your memories")
+        export_button.clicked.connect(self.export_memories)
+
+        import_button = QPushButton("Import Memories")
+        import_button.setToolTip("Create a backup of all your memories")
+        import_button.clicked.connect(self.import_memories)
+
+        import_export_actions.addWidget(export_button)
+        import_export_actions.addWidget(import_button)
+
+        # Add the second row to the actions layout
+        actions_layout.addLayout(import_export_actions)
 
         layout.addWidget(actions_group)
 
@@ -797,6 +823,7 @@ class MemoryKeeperApp(QMainWindow):
         metadata_layout = QFormLayout(metadata_group)
 
         self.category_combo = QComboBox()
+
         # Populate with categories from database
         categories = self.memory_keeper.get_categories()
         for category in categories:
@@ -1208,8 +1235,8 @@ class MemoryKeeperApp(QMainWindow):
         splitter.addWidget(left_widget)
         splitter.addWidget(right_widget)
 
-        # Set the initial sizes of the splitter (40% left, 60% right)
-        total_width = 1000  # Just a reference, will be adjusted
+        # Set the initial sizes of the splitter
+        total_width = 1000
         splitter.setSizes([int(total_width * 0.4), int(total_width * 0.6)])
 
         # Add the splitter to the main layout
@@ -1567,7 +1594,7 @@ class MemoryKeeperApp(QMainWindow):
 
         # Save the memory
         try:
-            self.memory_keeper.create_memory(
+            memory_id = self.memory_keeper.create_memory(
                 title = title,
                 content = content,
                 unlock_date = unlock_date,
@@ -1586,8 +1613,23 @@ class MemoryKeeperApp(QMainWindow):
             self.memory_content_input.clear()
             self.tags_input.clear()
 
-            # Refresh the dashboard
-            self.refresh_dashboard()
+            # Detemine if memory is immediately unlockable
+            is_unlockable = unlock_date <= datetime.now()
+
+            # Refresh all affected tabs
+            self.refresh_dashboard() # Always refresh the dashboard
+
+            if is_unlockable:
+                # If the memory is immediately unlockable, process it now
+                self.memory_keeper.unlock_memory(memory_id)
+                self.load_unlocked_memories() # Refresh unlocked memories tab
+            else:
+                # Otherwise, it goes to the vaule
+                self.refresh_vault_memories() # Refresh vault tab
+
+            # Switch to the Dashboard tab to show the updated stats
+            self.tabs.setCurrentIndex(0)
+
 
         except Exception as e:
             QMessageBox.critical(self, "Error", f"Failed to save memory: {str(e)}")
@@ -1712,6 +1754,360 @@ class MemoryKeeperApp(QMainWindow):
             print(f"Error unlocking memory: {e}")
             QMessageBox.critical(self, "Error",
                                  f"An error occurred: {str(e)}")
+            
+    def export_memories(self):
+        """Export all memories to a backup file."""
+        # Initialize the import/export helper if it doesn't exist
+        if not hasattr(self, 'import_export'):
+            self.import_export = MemoryKeeperImportExport(self.memory_keeper)
+        
+        # Call the export function
+        success, message = self.import_export.export_database()
+        
+        # Show result message
+        if success:
+            QMessageBox.information(self, "Export Complete", message)
+        else:
+            QMessageBox.warning(self, "Export Failed", message)
+        
+        # Refresh the dashboard
+        self.refresh_dashboard()
+
+    def import_memories(self):
+        """Import memories from a backup file."""
+        # Initialize the import/export helper if it doesn't exist
+        if not hasattr(self, 'import_export'):
+            self.import_export = MemoryKeeperImportExport(self.memory_keeper)
+        
+        # Ask user if they want to merge or replace
+        choice_msg = QMessageBox()
+        choice_msg.setIcon(QMessageBox.Question)
+        choice_msg.setWindowTitle("Import Options")
+        choice_msg.setText("How would you like to import memories?")
+        choice_msg.setInformativeText("You can either merge the imported memories with your existing collection, or replace your current memories entirely.")
+        
+        merge_button = choice_msg.addButton("Merge", QMessageBox.ActionRole)
+        replace_button = choice_msg.addButton("Replace", QMessageBox.ActionRole)
+        cancel_button = choice_msg.addButton("Cancel", QMessageBox.RejectRole)
+        
+        choice_msg.exec_()
+        
+        # Handle user choice
+        if choice_msg.clickedButton() == cancel_button:
+            return
+        
+        merge_mode = (choice_msg.clickedButton() == merge_button)
+        
+        # Call the import function with the selected mode
+        success, message = self.import_export.import_database(merge=merge_mode)
+        
+        # Show result message
+        if success:
+            QMessageBox.information(self, "Import Complete", message)
+            
+            # Refresh all tabs
+            self.refresh_dashboard()
+            self.refresh_vault_memories()
+            self.load_unlocked_memories()
+        else:
+            QMessageBox.warning(self, "Import Failed", message)
+            
+class MemoryKeeperImportExport:
+    """Helper class for handling import/export operations in MemoryKeeper."""
+
+    def __init__(self, memory_keeper):
+        """
+        Initialize with a reference to the MemoryKeeper instance.
+
+        Args:
+            memory_keeper: Reference to the MemoryKeeper instance
+        """
+        self.memory_keeper = memory_keeper
+
+    def export_database(self):
+        """
+        Export the entire database to a zip archive.
+        
+        Returns:
+            Tuple (success: bool, message: str) indicating operation result
+        """
+        try:
+            # Ask user for export location
+            export_file, _ = QFileDialog.getSaveFileName(
+                None, 
+                "Export Memories", 
+                str(Path.home() / "MemoryKeeper_Export.zip"),
+                "Zip Files (*.zip)"
+            )
+            
+            if not export_file:
+                return False, "Export cancelled"
+            
+            # Get database path
+            db_path = self.memory_keeper.db_path
+            
+            # Create a temporary directory for the export
+            with tempfile.TemporaryDirectory() as temp_dir:
+                temp_path = Path(temp_dir)
+                
+                # Copy database file
+                db_dest = temp_path / "memorykeeper.db"
+                shutil.copy2(db_path, db_dest)
+                
+                # Create metadata file
+                metadata = {
+                    "export_date": datetime.now().isoformat(),
+                    "app_version": "1.0",  # You can update this with actual version
+                    "memory_count": self.memory_keeper.get_memory_count()
+                }
+                
+                with open(temp_path / "metadata.json", "w") as f:
+                    json.dump(metadata, f, indent=2)
+                
+                # Create the zip file
+                with zipfile.ZipFile(export_file, 'w', zipfile.ZIP_DEFLATED) as zipf:
+                    # Add database and metadata files
+                    zipf.write(db_dest, "memorykeeper.db")
+                    zipf.write(temp_path / "metadata.json", "metadata.json")
+            
+            return True, f"Successfully exported to {export_file}"
+        
+        except Exception as e:
+            return False, f"Export failed: {str(e)}"
+        
+    def import_database(self, merge=True):
+        """
+        Import a database from a previously exported zip archive.
+        
+        Args:
+            merge: If True, merge imported memories with existing ones. 
+                  If False, replace the existing database.
+        
+        Returns:
+            Tuple (success: bool, message: str) indicating operation result
+        """
+        try:
+            # Ask user for import file
+            import_file, _ = QFileDialog.getOpenFileName(
+                None, 
+                "Import Memories", 
+                str(Path.home()),
+                "Zip Files (*.zip)"
+            )
+            
+            if not import_file:
+                return False, "Import cancelled"
+            
+            # Confirm import
+            confirm_msg = QMessageBox()
+            confirm_msg.setIcon(QMessageBox.Warning)
+            confirm_msg.setWindowTitle("Confirm Import")
+            
+            if merge:
+                confirm_msg.setText("Merge imported memories with your current memories?")
+                confirm_msg.setInformativeText("This will add the imported memories to your existing collection.")
+            else:
+                confirm_msg.setText("Importing will replace your current memories.")
+                confirm_msg.setInformativeText("Are you sure you want to proceed? This cannot be undone.")
+            
+            confirm_msg.setStandardButtons(QMessageBox.Yes | QMessageBox.No)
+            confirm_msg.setDefaultButton(QMessageBox.No)
+            
+            if confirm_msg.exec_() != QMessageBox.Yes:
+                return False, "Import cancelled"
+            
+            # Get database path
+            db_path = self.memory_keeper.db_path
+            
+            # Create a temporary directory for the import
+            with tempfile.TemporaryDirectory() as temp_dir:
+                temp_path = Path(temp_dir)
+                
+                # Extract the zip file
+                with zipfile.ZipFile(import_file, 'r') as zipf:
+                    zipf.extractall(temp_path)
+                
+                # Verify this is a valid export
+                if not (temp_path / "memorykeeper.db").exists():
+                    return False, "Invalid export file: Missing database"
+                
+                if not (temp_path / "metadata.json").exists():
+                    return False, "Invalid export file: Missing metadata"
+                
+                # Read metadata
+                with open(temp_path / "metadata.json", "r") as f:
+                    metadata = json.load(f)
+                
+                import_db_path = temp_path / "memorykeeper.db"
+                
+                if merge:
+                    # Merge databases
+                    imported_count = self._merge_databases(db_path, import_db_path)
+                    return True, f"Successfully imported and merged {imported_count} memories"
+                else:
+                    # Close any existing database connections
+                    if hasattr(self.memory_keeper, 'get_db_connection'):
+                        try:
+                            conn = self.memory_keeper.get_db_connection()
+                            conn.close()
+                        except:
+                            pass
+                    
+                    # Create a backup of the current database
+                    backup_path = str(db_path) + ".backup"
+                    shutil.copy2(db_path, backup_path)
+                    
+                    # Replace the database
+                    shutil.copy2(import_db_path, db_path)
+                    
+                    memory_count = metadata.get("memory_count", {})
+                    total_count = memory_count.get("total", "unknown")
+                    
+                    return True, f"Successfully imported {total_count} memories"
+            
+        except Exception as e:
+            # Restore from backup if available and not merging
+            if not merge and 'backup_path' in locals():
+                try:
+                    shutil.copy2(backup_path, db_path)
+                except Exception as backup_error:
+                    return False, f"Import failed: {str(e)}\nAlso failed to restore backup: {str(backup_error)}"
+            
+            return False, f"Import failed: {str(e)}"
+        
+    def _merge_databases(self, current_db_path, import_db_path):
+        """
+        Merge two SQLite databases, importing memories from import_db to current_db.
+        
+        Args:
+            current_db_path: Path to the current database
+            import_db_path: Path to the database being imported
+        
+        Returns:
+            Number of memories imported
+        """
+        # Connect to current database
+        current_conn = sqlite3.connect(current_db_path)
+        current_cursor = current_conn.cursor()
+        
+        # Connect to imported database
+        import_conn = sqlite3.connect(import_db_path)
+        import_conn.row_factory = sqlite3.Row
+        import_cursor = import_conn.cursor()
+        
+        # Track how many memories we import
+        imported_count = 0
+        
+        try:
+            # Get all categories from the import database
+            import_cursor.execute("SELECT id, name, description, icon FROM categories")
+            categories = import_cursor.fetchall()
+            
+            # Get existing categories to avoid duplicates
+            current_cursor.execute("SELECT id, name FROM categories")
+            existing_categories = {row[1]: row[0] for row in current_cursor.fetchall()}
+            
+            # Import categories
+            category_mapping = {}  # Maps imported category IDs to existing/new category IDs
+            
+            for category in categories:
+                cat_id, cat_name, cat_desc, cat_icon = category
+                
+                # If category name already exists, map to existing ID
+                if cat_name in existing_categories:
+                    category_mapping[cat_id] = existing_categories[cat_name]
+                else:
+                    # Otherwise, insert the category with its original ID
+                    current_cursor.execute(
+                        "INSERT OR IGNORE INTO categories (id, name, description, icon) VALUES (?, ?, ?, ?)",
+                        (cat_id, cat_name, cat_desc, cat_icon)
+                    )
+                    category_mapping[cat_id] = cat_id
+            
+            # Get all memories from the import database
+            import_cursor.execute("""
+                SELECT id, title, content, media_path, created_date, unlock_date,
+                       unlock_type, unlock_conditions, is_unlocked, category, mood, importance
+                FROM memories
+            """)
+            memories = import_cursor.fetchall()
+            
+            # Get existing memory IDs to avoid duplicates
+            current_cursor.execute("SELECT id FROM memories")
+            existing_memory_ids = {row[0] for row in current_cursor.fetchall()}
+            
+            # Import memories
+            for memory in memories:
+                memory_dict = dict(memory)
+                memory_id = memory_dict['id']
+                
+                # Skip if memory already exists
+                if memory_id in existing_memory_ids:
+                    continue
+                
+                # Update category ID if needed
+                if memory_dict['category'] in category_mapping:
+                    memory_dict['category'] = category_mapping[memory_dict['category']]
+                
+                # Insert memory
+                current_cursor.execute("""
+                    INSERT INTO memories 
+                    (id, title, content, media_path, created_date, unlock_date,
+                     unlock_type, unlock_conditions, is_unlocked, category, mood, importance)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """, (
+                    memory_dict['id'], memory_dict['title'], memory_dict['content'],
+                    memory_dict['media_path'], memory_dict['created_date'], memory_dict['unlock_date'],
+                    memory_dict['unlock_type'], memory_dict['unlock_conditions'], memory_dict['is_unlocked'],
+                    memory_dict['category'], memory_dict['mood'], memory_dict['importance']
+                ))
+                
+                imported_count += 1
+            
+            # Get and import memory tags
+            for memory_id in [m['id'] for m in memories if m['id'] not in existing_memory_ids]:
+                import_cursor.execute("SELECT tag FROM memory_tags WHERE memory_id = ?", (memory_id,))
+                tags = import_cursor.fetchall()
+                
+                for tag_row in tags:
+                    current_cursor.execute(
+                        "INSERT INTO memory_tags (memory_id, tag) VALUES (?, ?)",
+                        (memory_id, tag_row[0])
+                    )
+            
+            # Get and import responses
+            for memory_id in [m['id'] for m in memories if m['id'] not in existing_memory_ids]:
+                import_cursor.execute("""
+                    SELECT id, response_content, response_date, response_mood
+                    FROM responses WHERE memory_id = ?
+                """, (memory_id,))
+                responses = import_cursor.fetchall()
+                
+                for response in responses:
+                    response_dict = dict(response)
+                    current_cursor.execute("""
+                        INSERT INTO responses 
+                        (id, memory_id, response_content, response_date, response_mood)
+                        VALUES (?, ?, ?, ?, ?)
+                    """, (
+                        response_dict['id'], memory_id, response_dict['response_content'],
+                        response_dict['response_date'], response_dict['response_mood']
+                    ))
+            
+            # Commit all changes
+            current_conn.commit()
+            
+            return imported_count
+        
+        except Exception as e:
+            # Roll back on error
+            current_conn.rollback()
+            raise e
+        
+        finally:
+            # Close connections
+            current_conn.close()
+            import_conn.close()
 
 def main():
     """Main entry point for MemoryKeeper"""
