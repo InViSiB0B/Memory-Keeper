@@ -106,54 +106,7 @@ class MemoryKeeper:
             )
         conn.commit()
         conn.close()
-
-## Database Test Function
-# def test_database_setup():
-#     """Test function to verify the database setup is working correctly."""
-#     print("Testing database setup...")
-    
-#     # Create an instance of MemoryKeeper
-#     memory_keeper = MemoryKeeper()
-    
-#     # Check if we can connect to the database
-#     try:
-#         conn = memory_keeper.get_db_connection()
-#         print("Database connection successful")
-#         cursor = conn.cursor()
         
-#         # Test if tables were created by querying them
-#         cursor.execute("SELECT name FROM sqlite_master WHERE type='table'")
-#         tables = cursor.fetchall()
-#         print(f"Found {len(tables)} tables in the database:")
-#         for table in tables:
-#             print(f"  - {table[0]}")
-        
-#         # Test if categories were added
-#         cursor.execute("SELECT COUNT(*) FROM categories")
-#         category_count = cursor.fetchone()[0]
-#         print(f"Found {category_count} categories in the database")
-        
-#         # Show some category details
-#         if category_count > 0:
-#             cursor.execute("SELECT name, description FROM categories LIMIT 3")
-#             categories = cursor.fetchall()
-#             print("Sample categories:")
-#             for name, description in categories:
-#                 print(f"  - {name}: {description}")
-        
-#         conn.close()
-#         print("Database test completed successfully!")
-#         return True
-    
-#     except Exception as e:
-#         print(f"Error during database test: {e}")
-#         return False
-
-
-# # Run the test function
-# if __name__ == "__main__":
-#     test_database_setup()
-
     def get_db_connection(self):
         """Establish and return a database connection"""
         return sqlite3.connect(self.db_path)
